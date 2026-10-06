@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import logging
@@ -21,6 +22,8 @@ class HuggingFaceSpaceProvider(VideoProvider):
     def __init__(self, space_id: str = None, token: str = None):
         self.space_id = space_id or os.getenv("HF_SPACE_ID", "Lightricks/ltx-video-distilled")
         self.token = token or os.getenv("HF_TOKEN", None) or None
+        self._client = None
+        self._logged_api = False
         self._spaces_config = self._load_spaces_config()
 
     def _load_spaces_config(self) -> list:
@@ -32,50 +35,184 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 logger.error(f"Failed to read spaces.json: {e}")
         return []
 
+    def get_client(self):
+        """Reuse one Gradio Client per provider instance (Requirement 4)"""
+        if self._client is None:
+            from gradio_client import Client
+            self._client = Client(self.space_id, token=self.token)
+            if not self._logged_api:
+                try:
+                    api_info = self._client.view_api(return_format="dict")
+                    logger.info(f"Connected to HF Space '{self.space_id}' API Signature:\n{json.dumps(api_info, indent=2)}")
+                except Exception as e:
+                    logger.info(f"Connected to HF Space '{self.space_id}': {e}")
+                self._logged_api = True
+        return self._client
+
     async def is_available(self) -> bool:
         if not self.space_id:
             return False
         try:
-            from gradio_client import Client
-            client = Client(self.space_id, token=self.token)
+            client = self.get_client()
             api_info = client.view_api(return_format="dict")
             return bool(api_info)
         except Exception as e:
             logger.warning(f"HuggingFace Space '{self.space_id}' not reachable: {e}")
             return False
 
-    def inspect_and_map_endpoint(self, client, is_i2v: bool) -> tuple[str, list]:
-        """
-        Inspect client.view_api(return_format="dict") and find target endpoint parameter specs.
-        """
+    def select_endpoint(self, is_i2v: bool) -> str:
+        space_cfg = None
+        for item in self._spaces_config:
+            if item.get("id") == self.space_id:
+                space_cfg = item
+                break
+
+        if space_cfg and "endpoints" in space_cfg:
+            ep = space_cfg["endpoints"].get("i2v" if is_i2v else "t2v")
+            if ep:
+                return ep
+
+        return "/image_to_video" if is_i2v else "/text_to_video"
+
+    def _validate_and_coerce_type(self, p_name: str, val: any, p_python_type: str, spec: dict) -> any:
+        if val is None:
+            return None
+
+        # Check Literal / enum options
+        enum_options = spec.get("type", {}).get("enum")
+        if enum_options and val not in enum_options:
+            raise RuntimeError(f"Parameter '{p_name}' value '{val}' is invalid. Allowed options: {enum_options}")
+
+        p_type_str = str(spec.get("type", "")).lower()
+
+        if p_python_type == "bool" or "boolean" in p_type_str:
+            if isinstance(val, str):
+                if val.lower() in ["true", "1"]: return True
+                if val.lower() in ["false", "0"]: return False
+            return bool(val)
+        elif p_python_type == "int" or "integer" in p_type_str:
+            try:
+                return int(val)
+            except Exception:
+                raise RuntimeError(f"Parameter '{p_name}' expected int, got '{type(val).__name__}': {val}")
+        elif p_python_type == "float" or "number" in p_type_str:
+            try:
+                return float(val)
+            except Exception:
+                raise RuntimeError(f"Parameter '{p_name}' expected float, got '{type(val).__name__}': {val}")
+        elif p_python_type == "str" or "string" in p_type_str:
+            if not isinstance(val, (str, type(None))):
+                return str(val)
+
+        return val
+
+    def map_and_validate_parameters(
+        self,
+        client,
+        endpoint_name: str,
+        prompt: str,
+        negative_prompt: str,
+        image_path: str = None,
+        duration: int = 5,
+        width: int = 704,
+        height: int = 512,
+        fps: int = 24,
+        seed: int = 42,
+        is_fixed_seed: bool = False,
+        steps: int = 25,
+        guidance: float = 6.5,
+        is_i2v: bool = False
+    ) -> tuple[list, dict, list]:
+        from gradio_client import handle_file
+
         api_dict = client.view_api(return_format="dict")
         named = api_dict.get("named_endpoints", {})
         unnamed = api_dict.get("unnamed_endpoints", {})
-
         all_endpoints = {**named, **unnamed}
-        if not all_endpoints:
-            raise RuntimeError(f"HuggingFace Space '{self.space_id}' has no active API endpoints.")
 
-        chosen_endpoint = None
-        if is_i2v:
-            for candidate in ["/image_to_video", "/i2v", "/generate", "/predict"]:
-                if candidate in all_endpoints:
-                    chosen_endpoint = candidate
-                    break
-        else:
-            for candidate in ["/text_to_video", "/t2v", "/generate", "/predict"]:
-                if candidate in all_endpoints:
-                    chosen_endpoint = candidate
-                    break
+        if endpoint_name not in all_endpoints:
+            endpoint_name = list(all_endpoints.keys())[0]
 
-        if not chosen_endpoint:
-            chosen_endpoint = list(all_endpoints.keys())[0]
+        param_specs = all_endpoints[endpoint_name].get("parameters", [])
 
-        endpoint_info = all_endpoints[chosen_endpoint]
-        parameters = endpoint_info.get("parameters", [])
+        args = []
+        mapped_log = {}
+        clamped_notes = []
 
-        logger.info(f"Selected HF Space '{self.space_id}' endpoint '{chosen_endpoint}' with {len(parameters)} parameters.")
-        return chosen_endpoint, parameters
+        space_cfg = None
+        for item in self._spaces_config:
+            if item.get("id") == self.space_id:
+                space_cfg = item
+                break
+
+        param_map_table = space_cfg.get("parameter_mapping", {}) if space_cfg else {}
+
+        handle_img = handle_file(image_path) if (is_i2v and image_path and os.path.exists(image_path)) else None
+
+        for spec in param_specs:
+            p_name = spec.get("parameter_name") or spec.get("name") or ""
+            p_default = spec.get("parameter_default", spec.get("default", None))
+            p_type_info = spec.get("type", {})
+            p_python_type = spec.get("python_type", {}).get("type", "")
+
+            val = None
+
+            # Explicit parameter_name mapping (Requirement 1)
+            if p_name == "prompt":
+                val = prompt
+            elif p_name == "negative_prompt":
+                val = negative_prompt or ""
+            elif p_name == "input_image_filepath":
+                val = handle_img if is_i2v else None
+            elif p_name == "input_video_filepath":
+                val = None
+            elif p_name == "height_ui":
+                val = height
+            elif p_name == "width_ui":
+                val = width
+            elif p_name == "mode":
+                val = "image-to-video" if is_i2v else "text-to-video"
+            elif p_name == "duration_ui":
+                val = duration
+            elif p_name == "ui_frames_to_use":
+                # Leave at Space's parameter_default (9); never derive from duration
+                val = p_default if p_default is not None else 9
+            elif p_name == "seed_ui":
+                val = seed
+            elif p_name == "randomize_seed":
+                val = not bool(is_fixed_seed)
+            elif p_name == "ui_guidance_scale":
+                # Distilled model default is 1.0 unless user changed it from default 6.5
+                val = 1.0 if (guidance == 6.5 or guidance is None) else float(guidance)
+            elif p_name == "improve_texture_flag":
+                val = True
+            else:
+                val = p_default
+                logger.info(f"Parameter '{p_name}' has no explicit mapping rule. Using parameter_default: {p_default}")
+
+            # Numeric slider range bounds check
+            if isinstance(p_type_info, dict) and "description" in p_type_info:
+                desc = p_type_info["description"]
+                m = re.search(r"between\s+([\d\.]+)\s+and\s+([\d\.]+)", desc)
+                if m and isinstance(val, (int, float)):
+                    min_b = float(m.group(1))
+                    max_b = float(m.group(2))
+                    if val < min_b:
+                        logger.warning(f"Parameter '{p_name}' value {val} is below minimum {min_b}. Clamping to {min_b}")
+                        val = type(val)(min_b)
+                    elif val > max_b:
+                        logger.warning(f"Parameter '{p_name}' value {val} exceeds maximum {max_b}. Clamping to {max_b}")
+                        if p_name == "duration_ui":
+                            clamped_notes.append(f"Duration clamped to Space maximum ({max_b}s). Use 'Extend (+5s)' to generate longer clips.")
+                        val = type(val)(max_b)
+
+            # Validate and coerce type (Requirement 2)
+            val = self._validate_and_coerce_type(p_name, val, p_python_type, spec)
+
+            args.append(val)
+            mapped_log[p_name] = val
+
+        return args, mapped_log, clamped_notes
 
     async def generate_video(
         self,
@@ -87,50 +224,22 @@ class HuggingFaceSpaceProvider(VideoProvider):
         height: int = 720,
         fps: int = 24,
         seed: int = 42,
+        is_fixed_seed: bool = False,
         steps: int = 25,
         guidance: float = 6.5,
         job_id: str = None,
         progress_callback = None
     ) -> dict:
         try:
-            from gradio_client import Client, handle_file
-        except ImportError:
-            err_msg = "gradio_client python package is not installed."
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
-
-        if not self.space_id:
-            err_msg = "No HuggingFace Space ID configured in HF_SPACE_ID."
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
-
-        if progress_callback:
-            await progress_callback({
-                "job_id": job_id,
-                "status": "processing",
-                "progress": 10.0,
-                "current_step": 1,
-                "total_steps": steps or 25,
-                "eta_seconds": 30,
-                "message": f"Connecting to HuggingFace Space: {self.space_id}..."
-            })
-
-        try:
-            client = Client(self.space_id, token=self.token)
+            client = self.get_client()
         except Exception as e:
-            err_msg = str(e)
-            if "quota" in err_msg.lower():
-                err_msg = f"ZeroGPU quota exceeded for Space '{self.space_id}': {e}"
-            elif "sleeping" in err_msg.lower() or "building" in err_msg.lower():
-                err_msg = f"HuggingFace Space '{self.space_id}' is sleeping or building."
-            else:
-                err_msg = f"Failed to connect to HuggingFace Space '{self.space_id}': {e}"
+            err_msg = f"Failed to connect to HuggingFace Space '{self.space_id}': {e}"
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
         is_i2v = bool(image_url)
         temp_img_file = None
-        handle_img = None
+        local_img_path = None
 
         if is_i2v and image_url:
             if image_url.startswith("data:image"):
@@ -140,89 +249,48 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 temp_img_file = tempfile.NamedTemporaryFile("wb", delete=False, suffix=ext)
                 temp_img_file.write(img_bytes)
                 temp_img_file.close()
-                handle_img = handle_file(temp_img_file.name)
+                local_img_path = temp_img_file.name
             elif os.path.exists(image_url):
-                handle_img = handle_file(image_url)
+                local_img_path = image_url
 
-        endpoint_name, param_specs = self.inspect_and_map_endpoint(client, is_i2v)
+        endpoint_name = self.select_endpoint(is_i2v)
+        args, mapped_log, clamped_notes = self.map_and_validate_parameters(
+            client=client,
+            endpoint_name=endpoint_name,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image_path=local_img_path,
+            duration=duration,
+            width=width,
+            height=height,
+            fps=fps,
+            seed=seed,
+            is_fixed_seed=is_fixed_seed,
+            steps=steps,
+            guidance=guidance,
+            is_i2v=is_i2v
+        )
 
-        args = []
-        mapped_log = {}
-        unmapped = []
+        logger.info(f"Submitting to HF Space '{self.space_id}' endpoint '{endpoint_name}' with parameter values:\n{json.dumps({k: str(v) for k, v in mapped_log.items()}, indent=2)}")
 
-        for spec in param_specs:
-            p_name = str(spec.get("parameter_name") or spec.get("name") or "").lower()
-            p_label = str(spec.get("label", "")).lower()
-            p_type = str(spec.get("type", "")).lower()
+        if progress_callback:
+            msg = f"Connecting to HuggingFace Space: {self.space_id}..."
+            if clamped_notes:
+                msg += f" ({clamped_notes[0]})"
+            await progress_callback({
+                "job_id": job_id,
+                "status": "processing",
+                "progress": 10.0,
+                "current_step": 1,
+                "total_steps": steps or 25,
+                "eta_seconds": 30,
+                "message": msg
+            })
 
-            combined = f"{p_name} {p_label}"
-
-            if "frames_to_use" in combined or "frames to use" in combined or "ui_frames_to_use" in combined:
-                # Slider minimum is 9 for LTX-Video distilled
-                num_frames = max(9, int(duration * fps + 1))
-                args.append(num_frames)
-                mapped_log[p_name or p_label] = f"num_frames={num_frames}"
-            elif "duration" in combined:
-                args.append(duration)
-                mapped_log[p_name or p_label] = f"duration={duration}"
-            elif "prompt" in combined and "neg" not in combined:
-                args.append(prompt)
-                mapped_log[p_name or p_label] = "prompt"
-            elif "neg" in combined or "negative" in combined:
-                args.append(negative_prompt or "")
-                mapped_log[p_name or p_label] = "negative_prompt"
-            elif ("image" in combined or "img" in combined or "file" in p_type) and is_i2v and "video" not in combined:
-                args.append(handle_img)
-                mapped_log[p_name or p_label] = "image"
-            elif "video" in combined and "input" in combined:
-                args.append(None)
-                mapped_log[p_name or p_label] = "input_video=None"
-            elif "width" in combined:
-                args.append(width)
-                mapped_log[p_name or p_label] = f"width={width}"
-            elif "height" in combined:
-                args.append(height)
-                mapped_log[p_name or p_label] = f"height={height}"
-            elif "mode" in combined or "task" in combined:
-                mode_str = "image-to-video" if is_i2v else "text-to-video"
-                args.append(mode_str)
-                mapped_log[p_name or p_label] = f"mode={mode_str}"
-            elif "randomize" in combined:
-                args.append(False)
-                mapped_log[p_name or p_label] = "randomize_seed=False"
-            elif "texture" in combined:
-                args.append(True)
-                mapped_log[p_name or p_label] = "improve_texture=True"
-            elif "seed" in combined:
-                args.append(seed)
-                mapped_log[p_name or p_label] = f"seed={seed}"
-            elif "step" in combined:
-                args.append(steps or 25)
-                mapped_log[p_name or p_label] = f"steps={steps}"
-            elif "cfg" in combined or "guidance" in combined:
-                args.append(guidance or 6.5)
-                mapped_log[p_name or p_label] = f"guidance={guidance}"
-            else:
-                default_val = spec.get("parameter_default", spec.get("default", None))
-                args.append(default_val)
-                mapped_log[p_name or p_label] = f"default={default_val}"
-
-        logger.info(f"Mapped parameter inputs for endpoint '{endpoint_name}': {mapped_log}")
-
-        mapped_values = list(mapped_log.values())
-        if "prompt" not in mapped_values:
-            unmapped.append("prompt")
-        if is_i2v and "image" not in mapped_values:
-            unmapped.append("image")
-
-        if unmapped:
-            err_msg = f"HuggingFace Space '{self.space_id}' endpoint '{endpoint_name}' signature could not map required parameters: {unmapped}"
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
-
+        # Submit to Gradio queue with automated range error retry handling (Requirement 3)
+        result_tuple = None
         try:
             job = client.submit(*args, api_name=endpoint_name)
-
             step_count = 1
             while not job.done():
                 await asyncio.sleep(1.0)
@@ -244,36 +312,47 @@ class HuggingFaceSpaceProvider(VideoProvider):
                     })
 
             result_tuple = job.result()
-            # Gradio returns (video_dict_or_path, seed)
-            if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 0:
-                result_path = result_tuple[0]
-            else:
-                result_path = result_tuple
+        except Exception as err:
+            err_str = str(err)
+            # Range error parsing & one-time retry
+            m_range = re.search(r"Value\s+([\d\.]+)\s+is\s+(less|greater)\s+than\s+(minimum|maximum)\s+value\s+([\d\.]+)", err_str)
+            if m_range:
+                bad_val = float(m_range.group(1))
+                bound_val = float(m_range.group(4))
+                logger.warning(f"Gradio Range Error: Value {bad_val} out of bounds. Retrying once with clamped value {bound_val}...")
+                
+                # Update failing argument in positional list
+                for i in range(len(args)):
+                    if args[i] == bad_val or (isinstance(args[i], (int, float)) and abs(args[i] - bad_val) < 0.01):
+                        args[i] = type(args[i])(bound_val) if isinstance(args[i], int) else bound_val
 
-            if isinstance(result_path, dict) and "path" in result_path:
-                result_path = result_path["path"]
-
-        except Exception as e:
-            if temp_img_file and os.path.exists(temp_img_file.name):
-                try: os.remove(temp_img_file.name)
-                except Exception: pass
-            err_str = str(e)
-            if "quota" in err_str.lower() or "zerogpu" in err_str.lower():
-                err_msg = f"ZeroGPU Quota Exceeded on HuggingFace Space '{self.space_id}': {e}"
-            elif "timeout" in err_str.lower() or "queue" in err_str.lower():
-                err_msg = f"Queue Timeout on HuggingFace Space '{self.space_id}': {e}"
-            elif "sleeping" in err_str.lower():
-                err_msg = f"HuggingFace Space '{self.space_id}' is sleeping. Please wake it up on HF."
+                # Single retry
+                retry_job = client.submit(*args, api_name=endpoint_name)
+                while not retry_job.done():
+                    await asyncio.sleep(1.0)
+                result_tuple = retry_job.result()
             else:
-                err_msg = f"HuggingFace Space '{self.space_id}' API error: {e}"
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
+                # Verbatim error surfacing (Requirement 5)
+                if temp_img_file and os.path.exists(temp_img_file.name):
+                    try: os.remove(temp_img_file.name)
+                    except Exception: pass
+                logger.error(f"HuggingFace Space '{self.space_id}' verbatim error: {err_str}")
+                raise RuntimeError(err_str)
 
         if temp_img_file and os.path.exists(temp_img_file.name):
             try: os.remove(temp_img_file.name)
             except Exception: pass
 
-        if not result_path or not os.path.exists(result_path):
+        # Parse Gradio result tuple
+        if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 0:
+            result_path = result_tuple[0]
+        else:
+            result_path = result_tuple
+
+        if isinstance(result_path, dict) and "path" in result_path:
+            result_path = result_path["path"]
+
+        if not result_path or not os.path.exists(str(result_path)):
             err_msg = f"HuggingFace Space '{self.space_id}' returned no output video file."
             logger.error(err_msg)
             raise RuntimeError(err_msg)
@@ -290,7 +369,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
             if ffmpeg_bin:
                 import subprocess
                 subprocess.run([
-                    ffmpeg_bin, "-y", "-i", result_path,
+                    ffmpeg_bin, "-y", "-i", str(result_path),
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     dest_abs_path
                 ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -299,6 +378,9 @@ class HuggingFaceSpaceProvider(VideoProvider):
 
         local_url = f"/generated/projects/{project_id}/videos/{local_video_filename}"
         thumbnail_url = image_url if is_i2v else "https://images.unsplash.com/photo-1519501025264-65ba15a82390?auto=format&fit=crop&w=800&q=80"
+
+        # Requirement 5: Provider badge hf-space:Lightricks/ltx-video-distilled
+        provider_badge = f"hf-space:{self.space_id}"
 
         result = {
             "job_id": job_id,
@@ -310,7 +392,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
             "video_url": local_url,
             "thumbnail_url": thumbnail_url,
             "is_mock": False,
-            "provider": f"hf-space:{self.space_id}"
+            "provider": provider_badge
         }
 
         if progress_callback:

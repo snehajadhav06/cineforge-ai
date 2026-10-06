@@ -2,7 +2,24 @@
   {
     "id": "Lightricks/ltx-video-distilled",
     "name": "LTX-Video Distilled (Lightricks)",
-    "api_name": "/video_to_video",
-    "supported_modes": ["t2v", "i2v"]
+    "endpoints": {
+      "t2v": "/text_to_video",
+      "i2v": "/image_to_video"
+    },
+    "parameter_mapping": {
+      "prompt": "prompt",
+      "negative_prompt": "negative_prompt",
+      "input_image_filepath": "image",
+      "input_video_filepath": null,
+      "height_ui": "height",
+      "width_ui": "width",
+      "mode": "endpoint_mode",
+      "duration_ui": "duration",
+      "ui_frames_to_use": "default",
+      "seed_ui": "seed",
+      "randomize_seed": "randomize_seed",
+      "ui_guidance_scale": "guidance_distilled",
+      "improve_texture_flag": true
+    }
   }
 ]
