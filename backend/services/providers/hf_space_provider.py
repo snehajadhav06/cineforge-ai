@@ -19,7 +19,7 @@ CONFIG_SPACES_PATH = os.path.join(BASE_DIR, "config", "spaces.json")
 
 class HuggingFaceSpaceProvider(VideoProvider):
     def __init__(self, space_id: str = None, token: str = None):
-        self.space_id = space_id or os.getenv("HF_SPACE_ID", "Lightricks/LTX-Video-Demo")
+        self.space_id = space_id or os.getenv("HF_SPACE_ID", "Lightricks/ltx-video-distilled")
         self.token = token or os.getenv("HF_TOKEN", None) or None
         self._spaces_config = self._load_spaces_config()
 
@@ -70,7 +70,6 @@ class HuggingFaceSpaceProvider(VideoProvider):
 
         if not chosen_endpoint:
             chosen_endpoint = list(all_endpoints.keys())[0]
-
 
         endpoint_info = all_endpoints[chosen_endpoint]
         parameters = endpoint_info.get("parameters", [])
@@ -152,30 +151,48 @@ class HuggingFaceSpaceProvider(VideoProvider):
         unmapped = []
 
         for spec in param_specs:
-            p_name = str(spec.get("name", "")).lower()
+            p_name = str(spec.get("parameter_name") or spec.get("name") or "").lower()
             p_label = str(spec.get("label", "")).lower()
             p_type = str(spec.get("type", "")).lower()
 
             combined = f"{p_name} {p_label}"
 
-            if "prompt" in combined and "neg" not in combined:
+            if "frames_to_use" in combined or "frames to use" in combined or "ui_frames_to_use" in combined:
+                # Slider minimum is 9 for LTX-Video distilled
+                num_frames = max(9, int(duration * fps + 1))
+                args.append(num_frames)
+                mapped_log[p_name or p_label] = f"num_frames={num_frames}"
+            elif "duration" in combined:
+                args.append(duration)
+                mapped_log[p_name or p_label] = f"duration={duration}"
+            elif "prompt" in combined and "neg" not in combined:
                 args.append(prompt)
                 mapped_log[p_name or p_label] = "prompt"
             elif "neg" in combined or "negative" in combined:
                 args.append(negative_prompt or "")
                 mapped_log[p_name or p_label] = "negative_prompt"
-            elif ("image" in combined or "img" in combined or "file" in p_type) and is_i2v:
+            elif ("image" in combined or "img" in combined or "file" in p_type) and is_i2v and "video" not in combined:
                 args.append(handle_img)
                 mapped_log[p_name or p_label] = "image"
+            elif "video" in combined and "input" in combined:
+                args.append(None)
+                mapped_log[p_name or p_label] = "input_video=None"
             elif "width" in combined:
                 args.append(width)
                 mapped_log[p_name or p_label] = f"width={width}"
             elif "height" in combined:
                 args.append(height)
                 mapped_log[p_name or p_label] = f"height={height}"
-            elif "duration" in combined or "frame" in combined or "length" in combined:
-                args.append(duration)
-                mapped_log[p_name or p_label] = f"duration={duration}"
+            elif "mode" in combined or "task" in combined:
+                mode_str = "image-to-video" if is_i2v else "text-to-video"
+                args.append(mode_str)
+                mapped_log[p_name or p_label] = f"mode={mode_str}"
+            elif "randomize" in combined:
+                args.append(False)
+                mapped_log[p_name or p_label] = "randomize_seed=False"
+            elif "texture" in combined:
+                args.append(True)
+                mapped_log[p_name or p_label] = "improve_texture=True"
             elif "seed" in combined:
                 args.append(seed)
                 mapped_log[p_name or p_label] = f"seed={seed}"
@@ -186,7 +203,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 args.append(guidance or 6.5)
                 mapped_log[p_name or p_label] = f"guidance={guidance}"
             else:
-                default_val = spec.get("default", None)
+                default_val = spec.get("parameter_default", spec.get("default", None))
                 args.append(default_val)
                 mapped_log[p_name or p_label] = f"default={default_val}"
 
@@ -226,7 +243,16 @@ class HuggingFaceSpaceProvider(VideoProvider):
                         "message": msg
                     })
 
-            result_path = job.result()
+            result_tuple = job.result()
+            # Gradio returns (video_dict_or_path, seed)
+            if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 0:
+                result_path = result_tuple[0]
+            else:
+                result_path = result_tuple
+
+            if isinstance(result_path, dict) and "path" in result_path:
+                result_path = result_path["path"]
+
         except Exception as e:
             if temp_img_file and os.path.exists(temp_img_file.name):
                 try: os.remove(temp_img_file.name)
@@ -248,7 +274,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
             except Exception: pass
 
         if not result_path or not os.path.exists(result_path):
-            err_msg = f"HuggingFace Space '{self.space_id}' returned no output file."
+            err_msg = f"HuggingFace Space '{self.space_id}' returned no output video file."
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
@@ -257,7 +283,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
         local_video_filename = f"{job_id}.mp4"
         dest_abs_path = os.path.join(dirs["videos"], local_video_filename)
 
-        if result_path.endswith(".mp4"):
+        if str(result_path).endswith(".mp4"):
             shutil.copy(result_path, dest_abs_path)
         else:
             ffmpeg_bin = ffmpeg_service.get_ffmpeg_path()
