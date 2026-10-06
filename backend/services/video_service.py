@@ -18,6 +18,8 @@ from backend.services.providers.hf_space_provider import hf_space_provider
 logger = logging.getLogger("cineforge.video_service")
 JOB_QUEUES: Dict[str, asyncio.Queue] = {}
 
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
 
 class VideoService:
     @staticmethod
@@ -44,8 +46,20 @@ class VideoService:
     @staticmethod
     async def create_and_run_generation(req: GenerationRequest, db: Session) -> Generation:
         seed = req.seed if req.seed is not None else int(datetime.utcnow().timestamp() * 1000) % 90000000
-
         width, height = get_model_valid_dimensions(req.resolution or "512p", req.aspect_ratio or "16:9")
+
+        mode_env = os.getenv("MODE", "local").lower()
+
+        # Determine target provider for hash & DB tagging
+        if mode_env == "mock":
+            target_provider = "mock"
+        else:
+            if await comfyui_provider.is_available():
+                target_provider = f"comfyui:{req.model_id or 'ltx-video'}"
+            elif await hf_space_provider.is_available():
+                target_provider = f"hf-space:{hf_space_provider.space_id}"
+            else:
+                target_provider = "none"
 
         sha256_hash = cache_service.compute_generation_hash(
             prompt=req.prompt,
@@ -58,12 +72,30 @@ class VideoService:
             fps=req.fps or 24,
             steps=req.steps or 25,
             guidance=req.guidance or 6.5,
-            input_image_hash=req.reference_image_url or ""
+            input_image_hash=req.reference_image_url or "",
+            mode=req.mode or "text-to-video",
+            provider=target_provider
         )
 
+        # Cache check rule: only return existing if completed, file exists on disk, and not mock unless MODE=mock
         existing = db.query(Generation).filter(Generation.sha256_hash == sha256_hash).first()
         if existing:
-            return existing
+            is_valid_cache = False
+            if existing.status == "completed" and existing.video_url:
+                clean_url = existing.video_url.lstrip("/")
+                video_abs_path = os.path.join(BASE_DIR, clean_url)
+                if os.path.exists(video_abs_path) and os.path.getsize(video_abs_path) > 0:
+                    is_mock_result = (existing.provider == "mock")
+                    if mode_env == "mock" or not is_mock_result:
+                        is_valid_cache = True
+
+            if is_valid_cache:
+                logger.info(f"Returning cached generation {existing.id} (provider={existing.provider})")
+                return existing
+            else:
+                logger.info(f"Invalidating stale cache row {existing.id} (status={existing.status}, provider={existing.provider})")
+                db.delete(existing)
+                db.commit()
 
         storage_service.get_project_dirs(req.project_id or "default")
         gen_id = f"gen-{uuid.uuid4().hex[:12]}"
@@ -93,6 +125,7 @@ class VideoService:
             thumbnail_url=req.reference_image_url,
             is_favorite=False,
             sha256_hash=sha256_hash,
+            provider="mock" if mode_env == "mock" else target_provider,
             created_at=datetime.utcnow()
         )
 
@@ -121,35 +154,38 @@ class VideoService:
                         g.video_url = event["video_url"]
                     if event.get("thumbnail_url"):
                         g.thumbnail_url = event["thumbnail_url"]
+                    if event.get("provider"):
+                        g.provider = event["provider"]
                     db_session.commit()
             finally:
                 db_session.close()
 
-        mode_env = os.getenv("MODE", "mock").lower()
+        mode_env = os.getenv("MODE", "local").lower()
 
         try:
             if mode_env == "mock":
                 provider = mock_video_provider
+                provider_tag = "mock"
             else:
-                # MODE is local or cloud: Provider Order Check
-                # 1. ComfyUI if reachable
+                # MODE is local or cloud: Strict generator availability check
                 if await comfyui_provider.is_available():
                     provider = comfyui_provider
-                # 2. HuggingFace Space if configured and reachable
+                    provider_tag = f"comfyui:{req.model_id or 'ltx-video'}"
                 elif await hf_space_provider.is_available():
                     provider = hf_space_provider
-                # 3. Otherwise show clear error message. NEVER fall back to mock when MODE is not mock!
+                    provider_tag = f"hf-space:{hf_space_provider.space_id}"
                 else:
                     err_msg = (
-                        "No video generator available. Please start ComfyUI locally (http://127.0.0.1:8188) "
-                        "or configure a valid HuggingFace Space in HF_SPACE_ID."
+                        "No video generator is reachable. "
+                        "ComfyUI is offline at http://127.0.0.1:8188 and HuggingFace Space is not reachable. "
+                        "Please start ComfyUI locally or configure a valid HuggingFace Space in HF_SPACE_ID."
                     )
                     logger.error(err_msg)
                     fail_event = {"job_id": gen_id, "status": "failed", "error": err_msg, "message": err_msg}
                     await on_progress(fail_event)
                     return
 
-            await provider.generate_video(
+            res = await provider.generate_video(
                 prompt=req.prompt,
                 negative_prompt=req.negative_prompt or "",
                 image_url=req.reference_image_url,
@@ -163,6 +199,9 @@ class VideoService:
                 job_id=gen_id,
                 progress_callback=on_progress
             )
+            res["provider"] = provider_tag
+            await on_progress(res)
+
         except Exception as err:
             err_msg = str(err)
             fail_event = {"job_id": gen_id, "status": "failed", "error": err_msg, "message": err_msg}

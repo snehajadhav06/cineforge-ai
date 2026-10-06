@@ -1,5 +1,56 @@
 {
+  "1": {
+    "inputs": {
+      "ckpt_name": "ltx-video-2b-v0.9.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple"
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "t5xxl_fp16.safetensors",
+      "type": "ltxv"
+    },
+    "class_type": "CLIPLoader"
+  },
   "3": {
+    "inputs": {
+      "text": "{{PROMPT}}",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "4": {
+    "inputs": {
+      "text": "{{NEGATIVE_PROMPT}}",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "5": {
+    "inputs": {
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "frame_rate": "{{FPS}}"
+    },
+    "class_type": "LTXVConditioning"
+  },
+  "6": {
+    "inputs": {
+      "image": "{{IMAGE_NAME}}"
+    },
+    "class_type": "LoadImage"
+  },
+  "7": {
+    "inputs": {
+      "image": ["6", 0],
+      "vae": ["1", 2],
+      "width": "{{WIDTH}}",
+      "height": "{{HEIGHT}}",
+      "length": "{{FRAMES}}"
+    },
+    "class_type": "LTXVImgToVideo"
+  },
+  "8": {
     "inputs": {
       "seed": "{{SEED}}",
       "steps": "{{STEPS}}",
@@ -7,59 +58,26 @@
       "sampler_name": "euler",
       "scheduler": "normal",
       "denoise": 0.85,
-      "model": ["4", 0],
-      "positive": ["6", 0],
-      "negative": ["7", 0],
-      "latent_image": ["10", 0]
+      "model": ["1", 0],
+      "positive": ["5", 0],
+      "negative": ["5", 1],
+      "latent_image": ["7", 0]
     },
     "class_type": "KSampler"
   },
-  "4": {
+  "9": {
     "inputs": {
-      "ckpt_name": "ltx-video-2b-v0.9.safetensors"
-    },
-    "class_type": "CheckpointLoaderSimple"
-  },
-  "6": {
-    "inputs": {
-      "text": "{{PROMPT}}",
-      "clip": ["4", 1]
-    },
-    "class_type": "CLIPTextEncode"
-  },
-  "7": {
-    "inputs": {
-      "text": "{{NEGATIVE_PROMPT}}",
-      "clip": ["4", 1]
-    },
-    "class_type": "CLIPTextEncode"
-  },
-  "8": {
-    "inputs": {
-      "samples": ["3", 0],
-      "vae": ["4", 2]
+      "samples": ["8", 0],
+      "vae": ["1", 2]
     },
     "class_type": "VAEDecode"
   },
-  "9": {
+  "10": {
     "inputs": {
       "filename_prefix": "CineForge_LTXV_I2V",
       "fps": "{{FPS}}",
-      "images": ["8", 0]
+      "images": ["9", 0]
     },
     "class_type": "VHS_VideoCombine"
-  },
-  "10": {
-    "inputs": {
-      "pixels": ["11", 0],
-      "vae": ["4", 2]
-    },
-    "class_type": "VAEEncode"
-  },
-  "11": {
-    "inputs": {
-      "image": "{{IMAGE_NAME}}"
-    },
-    "class_type": "LoadImage"
   }
 }

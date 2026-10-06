@@ -137,13 +137,15 @@ class MockVideoProvider(VideoProvider):
             "eta_seconds": 0,
             "video_url": local_url,
             "thumbnail_url": thumbnail_url,
-            "is_mock": True
+            "is_mock": True,
+            "provider": "mock"
         }
 
         if progress_callback:
             await progress_callback(result)
 
         return result
+
 
 
 mock_video_provider = MockVideoProvider()

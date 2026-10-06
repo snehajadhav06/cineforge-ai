@@ -8,7 +8,8 @@
     "supportedResolutions": ["512p", "720p"],
     "supportedRatios": ["16:9", "9:16", "1:1"],
     "supportedFps": [16, 24],
-    "workflowFile": "ltx_video_t2v.json",
+    "workflowFile": "ltxv_t2v.json",
+
     "description": "Fast, highly efficient real-time local text-to-video & image-to-video model.",
     "isDefault": true
   },

@@ -32,17 +32,6 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 logger.error(f"Failed to read spaces.json: {e}")
         return []
 
-    def get_space_info(self, space_id: str) -> dict:
-        for space in self._spaces_config:
-            if space.get("id") == space_id:
-                return space
-        return {
-            "id": space_id,
-            "name": space_id,
-            "api_name": "/generate",
-            "supported_modes": ["t2v", "i2v"]
-        }
-
     async def is_available(self) -> bool:
         if not self.space_id:
             return False
@@ -50,11 +39,44 @@ class HuggingFaceSpaceProvider(VideoProvider):
             from gradio_client import Client
             client = Client(self.space_id, token=self.token)
             api_info = client.view_api(return_format="dict")
-            logger.info(f"HuggingFace Space '{self.space_id}' API Signature: {api_info}")
-            return True
+            return bool(api_info)
         except Exception as e:
             logger.warning(f"HuggingFace Space '{self.space_id}' not reachable: {e}")
             return False
+
+    def inspect_and_map_endpoint(self, client, is_i2v: bool) -> tuple[str, list]:
+        """
+        Inspect client.view_api(return_format="dict") and find target endpoint parameter specs.
+        """
+        api_dict = client.view_api(return_format="dict")
+        named = api_dict.get("named_endpoints", {})
+        unnamed = api_dict.get("unnamed_endpoints", {})
+
+        all_endpoints = {**named, **unnamed}
+        if not all_endpoints:
+            raise RuntimeError(f"HuggingFace Space '{self.space_id}' has no active API endpoints.")
+
+        chosen_endpoint = None
+        if is_i2v:
+            for candidate in ["/image_to_video", "/i2v", "/generate", "/predict"]:
+                if candidate in all_endpoints:
+                    chosen_endpoint = candidate
+                    break
+        else:
+            for candidate in ["/text_to_video", "/t2v", "/generate", "/predict"]:
+                if candidate in all_endpoints:
+                    chosen_endpoint = candidate
+                    break
+
+        if not chosen_endpoint:
+            chosen_endpoint = list(all_endpoints.keys())[0]
+
+
+        endpoint_info = all_endpoints[chosen_endpoint]
+        parameters = endpoint_info.get("parameters", [])
+
+        logger.info(f"Selected HF Space '{self.space_id}' endpoint '{chosen_endpoint}' with {len(parameters)} parameters.")
+        return chosen_endpoint, parameters
 
     async def generate_video(
         self,
@@ -97,14 +119,17 @@ class HuggingFaceSpaceProvider(VideoProvider):
         try:
             client = Client(self.space_id, token=self.token)
         except Exception as e:
-            err_msg = f"Failed to connect to HuggingFace Space '{self.space_id}': {e}"
+            err_msg = str(e)
+            if "quota" in err_msg.lower():
+                err_msg = f"ZeroGPU quota exceeded for Space '{self.space_id}': {e}"
+            elif "sleeping" in err_msg.lower() or "building" in err_msg.lower():
+                err_msg = f"HuggingFace Space '{self.space_id}' is sleeping or building."
+            else:
+                err_msg = f"Failed to connect to HuggingFace Space '{self.space_id}': {e}"
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
         is_i2v = bool(image_url)
-        space_info = self.get_space_info(self.space_id)
-        api_name = space_info.get("api_name", "/generate")
-
         temp_img_file = None
         handle_img = None
 
@@ -120,17 +145,67 @@ class HuggingFaceSpaceProvider(VideoProvider):
             elif os.path.exists(image_url):
                 handle_img = handle_file(image_url)
 
-        # Call client.submit with args according to Space API
-        try:
-            # Prepare arguments matching common LTX/Wan Gradio space signatures
-            if is_i2v:
-                args = (prompt, negative_prompt, handle_img, height, width, duration, seed, steps, guidance)
+        endpoint_name, param_specs = self.inspect_and_map_endpoint(client, is_i2v)
+
+        args = []
+        mapped_log = {}
+        unmapped = []
+
+        for spec in param_specs:
+            p_name = str(spec.get("name", "")).lower()
+            p_label = str(spec.get("label", "")).lower()
+            p_type = str(spec.get("type", "")).lower()
+
+            combined = f"{p_name} {p_label}"
+
+            if "prompt" in combined and "neg" not in combined:
+                args.append(prompt)
+                mapped_log[p_name or p_label] = "prompt"
+            elif "neg" in combined or "negative" in combined:
+                args.append(negative_prompt or "")
+                mapped_log[p_name or p_label] = "negative_prompt"
+            elif ("image" in combined or "img" in combined or "file" in p_type) and is_i2v:
+                args.append(handle_img)
+                mapped_log[p_name or p_label] = "image"
+            elif "width" in combined:
+                args.append(width)
+                mapped_log[p_name or p_label] = f"width={width}"
+            elif "height" in combined:
+                args.append(height)
+                mapped_log[p_name or p_label] = f"height={height}"
+            elif "duration" in combined or "frame" in combined or "length" in combined:
+                args.append(duration)
+                mapped_log[p_name or p_label] = f"duration={duration}"
+            elif "seed" in combined:
+                args.append(seed)
+                mapped_log[p_name or p_label] = f"seed={seed}"
+            elif "step" in combined:
+                args.append(steps or 25)
+                mapped_log[p_name or p_label] = f"steps={steps}"
+            elif "cfg" in combined or "guidance" in combined:
+                args.append(guidance or 6.5)
+                mapped_log[p_name or p_label] = f"guidance={guidance}"
             else:
-                args = (prompt, negative_prompt, height, width, duration, seed, steps, guidance)
+                default_val = spec.get("default", None)
+                args.append(default_val)
+                mapped_log[p_name or p_label] = f"default={default_val}"
 
-            job = client.submit(*args, api_name=api_name)
+        logger.info(f"Mapped parameter inputs for endpoint '{endpoint_name}': {mapped_log}")
 
-            # Monitor queue position & status
+        mapped_values = list(mapped_log.values())
+        if "prompt" not in mapped_values:
+            unmapped.append("prompt")
+        if is_i2v and "image" not in mapped_values:
+            unmapped.append("image")
+
+        if unmapped:
+            err_msg = f"HuggingFace Space '{self.space_id}' endpoint '{endpoint_name}' signature could not map required parameters: {unmapped}"
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
+
+        try:
+            job = client.submit(*args, api_name=endpoint_name)
+
             step_count = 1
             while not job.done():
                 await asyncio.sleep(1.0)
@@ -138,7 +213,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 status = job.status()
                 eta = status.eta if hasattr(status, 'eta') and status.eta is not None else max(0, 45 - step_count)
                 queue_pos = getattr(status, 'queue_size', None)
-                msg = f"HF Space Queue: position {queue_pos}" if queue_pos else "HF Space synthesizing video..."
+                msg = f"HF Space Queue position: {queue_pos}" if queue_pos else "HF Space synthesizing AI video..."
 
                 if progress_callback:
                     await progress_callback({
@@ -156,7 +231,15 @@ class HuggingFaceSpaceProvider(VideoProvider):
             if temp_img_file and os.path.exists(temp_img_file.name):
                 try: os.remove(temp_img_file.name)
                 except Exception: pass
-            err_msg = f"HuggingFace Space '{self.space_id}' API error or quota exceeded: {e}"
+            err_str = str(e)
+            if "quota" in err_str.lower() or "zerogpu" in err_str.lower():
+                err_msg = f"ZeroGPU Quota Exceeded on HuggingFace Space '{self.space_id}': {e}"
+            elif "timeout" in err_str.lower() or "queue" in err_str.lower():
+                err_msg = f"Queue Timeout on HuggingFace Space '{self.space_id}': {e}"
+            elif "sleeping" in err_str.lower():
+                err_msg = f"HuggingFace Space '{self.space_id}' is sleeping. Please wake it up on HF."
+            else:
+                err_msg = f"HuggingFace Space '{self.space_id}' API error: {e}"
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
@@ -169,13 +252,11 @@ class HuggingFaceSpaceProvider(VideoProvider):
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
-        # Copy & convert result file into generated/projects/default/videos/<job_id>.mp4
         project_id = "default"
         dirs = storage_service.get_project_dirs(project_id)
         local_video_filename = f"{job_id}.mp4"
         dest_abs_path = os.path.join(dirs["videos"], local_video_filename)
 
-        # Ensure H.264 MP4 conversion if returned file is webm/avi/mkv
         if result_path.endswith(".mp4"):
             shutil.copy(result_path, dest_abs_path)
         else:
@@ -203,7 +284,7 @@ class HuggingFaceSpaceProvider(VideoProvider):
             "video_url": local_url,
             "thumbnail_url": thumbnail_url,
             "is_mock": False,
-            "provider_badge": f"AI: HuggingFace Space ({self.space_id})"
+            "provider": f"hf-space:{self.space_id}"
         }
 
         if progress_callback:

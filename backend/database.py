@@ -78,6 +78,7 @@ class Generation(Base):
     thumbnail_url = Column(Text, nullable=True)
     is_favorite = Column(Boolean, default=False)
     sha256_hash = Column(String, index=True, nullable=True)
+    provider = Column(String, nullable=False, default="mock")  # mock | comfyui:<model> | hf-space:<space_id>
     created_at = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="generations")
@@ -117,7 +118,17 @@ class GenerationJob(Base):
 
 
 def init_db():
+    from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
+    
+    # Safe SQLite column migration for 'provider' column in 'generations'
+    with engine.connect() as conn:
+        result = conn.execute(text("PRAGMA table_info(generations)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "provider" not in columns:
+            conn.execute(text("ALTER TABLE generations ADD COLUMN provider VARCHAR DEFAULT 'mock'"))
+            conn.commit()
+
     # Ensure default project exists
     db = SessionLocal()
     try:
@@ -132,6 +143,7 @@ def init_db():
             db.commit()
     finally:
         db.close()
+
 
 
 def get_db():

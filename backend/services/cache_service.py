@@ -19,9 +19,11 @@ class CacheService:
         fps: int,
         steps: int,
         guidance: float,
-        input_image_hash: str = ""
+        input_image_hash: str = "",
+        mode: str = "text-to-video",
+        provider: str = "mock"
     ) -> str:
-        content = f"{prompt.strip()}|{negative_prompt.strip()}|{model_id}|{seed}|{width}|{height}|{duration}|{fps}|{steps}|{guidance}|{input_image_hash}"
+        content = f"{prompt.strip()}|{negative_prompt.strip()}|{model_id}|{seed}|{width}|{height}|{duration}|{fps}|{steps}|{guidance}|{input_image_hash}|{mode}|{provider}"
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
 

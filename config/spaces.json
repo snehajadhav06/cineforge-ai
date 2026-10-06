@@ -1,23 +1,8 @@
 [
   {
-    "id": "Lightricks/LTX-Video-Demo",
-    "name": "LTX-Video Demo (Lightricks)",
-    "api_name": "/generate",
-    "supported_modes": ["t2v", "i2v"],
-    "input_order": ["prompt", "negative_prompt", "image", "height", "width", "duration", "seed", "steps", "cfg"]
-  },
-  {
-    "id": "Wan-AI/Wan2.1-T2V-1.3B",
-    "name": "Wan 2.1 T2V 1.3B",
-    "api_name": "/predict",
-    "supported_modes": ["t2v"],
-    "input_order": ["prompt", "negative_prompt", "height", "width", "duration", "seed", "steps", "cfg"]
-  },
-  {
-    "id": "multimodalart/LTX-Video",
-    "name": "LTX-Video Space (Multimodalart)",
-    "api_name": "/generate",
-    "supported_modes": ["t2v", "i2v"],
-    "input_order": ["prompt", "negative_prompt", "image", "height", "width", "duration", "seed", "steps", "cfg"]
+    "id": "Lightricks/ltx-video-distilled",
+    "name": "LTX-Video Distilled (Lightricks)",
+    "api_name": "/video_to_video",
+    "supported_modes": ["t2v", "i2v"]
   }
 ]

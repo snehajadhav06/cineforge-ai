@@ -68,7 +68,9 @@ class GenerationResponse(BaseModel):
     thumbnail_url: Optional[str] = None
     is_favorite: bool
     sha256_hash: Optional[str] = None
+    provider: Optional[str] = "mock"
     created_at: datetime
+
 
     class Config:
         from_attributes = True
