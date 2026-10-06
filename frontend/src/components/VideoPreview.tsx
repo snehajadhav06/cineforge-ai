@@ -70,9 +70,14 @@ export const VideoPreview: React.FC<VideoPreviewProps> = ({
               {currentJob?.errorMessage || 'An error occurred during AI video synthesis.'}
             </p>
             <p className="text-[11px] text-slate-400">
-              Ensure local ComfyUI is running or configure a valid HuggingFace Space in .env.
+              {currentJob?.provider?.startsWith('comfyui:')
+                ? 'Ensure local ComfyUI is running on http://127.0.0.1:8188.'
+                : currentJob?.provider?.startsWith('hf-space:')
+                ? 'HuggingFace Space Provider Error. Check space status or HF_TOKEN.'
+                : ''}
             </p>
           </div>
+
         )}
 
         {/* Active Progress Overlay */}

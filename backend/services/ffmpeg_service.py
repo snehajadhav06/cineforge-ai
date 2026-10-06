@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import base64
@@ -92,7 +93,6 @@ class FFmpegService:
             elif image_input and os.path.exists(image_input):
                 input_path = image_input
             else:
-                # If image input is invalid or a remote web URL, fall back to test pattern video
                 return self.generate_test_pattern_video(output_path, width, height, fps, duration)
 
             total_frames = int(duration * fps)
@@ -114,10 +114,8 @@ class FFmpegService:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             if temp_img_file and os.path.exists(temp_img_file.name):
-                try:
-                    os.remove(temp_img_file.name)
-                except Exception:
-                    pass
+                try: os.remove(temp_img_file.name)
+                except Exception: pass
 
             if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 return True
@@ -127,6 +125,97 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"Exception generating Ken Burns video: {e}")
             return self.generate_test_pattern_video(output_path, width, height, fps, duration)
+
+    def extract_last_frame(self, video_path: str, output_image_path: str) -> bool:
+        ffmpeg_bin = self.get_ffmpeg_path()
+        if not ffmpeg_bin or not os.path.exists(video_path):
+            return False
+        os.makedirs(os.path.dirname(output_image_path), exist_ok=True)
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-sseof", "-1",
+            "-i", video_path,
+            "-update", "1",
+            "-q:v", "2",
+            output_image_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return res.returncode == 0 and os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0
+        except Exception as e:
+            logger.error(f"Failed to extract last frame with FFmpeg: {e}")
+            return False
+
+    def concat_videos(self, video_paths: list[str], output_path: str) -> bool:
+        ffmpeg_bin = self.get_ffmpeg_path()
+        if not ffmpeg_bin or not video_paths:
+            return False
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        list_file = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt")
+        for vp in video_paths:
+            clean_vp = os.path.abspath(vp).replace("\\", "/")
+            list_file.write(f"file '{clean_vp}'\n")
+        list_file.close()
+
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file.name,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if os.path.exists(list_file.name):
+                try: os.remove(list_file.name)
+                except Exception: pass
+            return res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        except Exception as e:
+            if os.path.exists(list_file.name):
+                try: os.remove(list_file.name)
+                except Exception: pass
+            logger.error(f"Failed to concat videos with FFmpeg: {e}")
+            return False
+
+    def extract_thumbnail(self, video_path: str, output_thumb_path: str) -> bool:
+        ffmpeg_bin = self.get_ffmpeg_path()
+        if not ffmpeg_bin or not os.path.exists(video_path):
+            return False
+        os.makedirs(os.path.dirname(output_thumb_path), exist_ok=True)
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-ss", "00:00:00.500",
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            output_thumb_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return res.returncode == 0 and os.path.exists(output_thumb_path)
+        except Exception:
+            return False
+
+    def get_video_duration(self, video_path: str) -> float:
+        ffmpeg_bin = self.get_ffmpeg_path()
+        if not ffmpeg_bin or not os.path.exists(video_path):
+            return 0.0
+        cmd = [
+            ffmpeg_bin, "-i", video_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode("utf-8", errors="ignore")
+            m = re.search(r"Duration:\s*(\d+):(\d+):([\d\.]+)", res)
+            if m:
+                hrs, mins, secs = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                return hrs * 3600 + mins * 60 + secs
+        except Exception:
+            pass
+        return 0.0
 
 
 ffmpeg_service = FFmpegService()

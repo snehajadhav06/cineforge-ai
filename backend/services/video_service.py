@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Dict, AsyncGenerator
 from sqlalchemy.orm import Session
 from backend.database import Generation, SessionLocal
-from backend.schemas import GenerationRequest
+from backend.schemas import GenerationRequest, ExtendRequest
 from backend.services.cache_service import cache_service
 from backend.services.storage_service import storage_service
 from backend.services.resolution_helper import get_model_valid_dimensions
@@ -77,7 +77,6 @@ class VideoService:
             provider=target_provider
         )
 
-        # Cache check rule: only return existing if completed, file exists on disk, and not mock unless MODE=mock
         existing = db.query(Generation).filter(Generation.sha256_hash == sha256_hash).first()
         if existing:
             is_valid_cache = False
@@ -137,6 +136,46 @@ class VideoService:
         return generation
 
     @staticmethod
+    async def create_and_run_extension(base_gen: Generation, req: ExtendRequest, db: Session) -> Generation:
+        gen_id = f"gen-{uuid.uuid4().hex[:12]}"
+        extended_prompt = f"{base_gen.prompt} (Continuation sequence +{req.additional_duration or 5}s)"
+
+        generation = Generation(
+            id=gen_id,
+            project_id=base_gen.project_id or "default",
+            prompt=extended_prompt,
+            negative_prompt=base_gen.negative_prompt,
+            mode=base_gen.mode,
+            reference_image_url=base_gen.reference_image_url,
+            model_id=base_gen.model_id,
+            duration=base_gen.duration + (req.additional_duration or 5),
+            aspect_ratio=base_gen.aspect_ratio,
+            resolution=base_gen.resolution,
+            fps=base_gen.fps,
+            seed=base_gen.seed + 1,
+            is_fixed_seed=True,
+            steps=base_gen.steps,
+            guidance=base_gen.guidance,
+            status="queued",
+            progress=0.0,
+            current_step=0,
+            total_steps=base_gen.steps,
+            eta_seconds=25,
+            video_url=None,
+            thumbnail_url=base_gen.thumbnail_url,
+            is_favorite=False,
+            provider=base_gen.provider or "hf-space:Lightricks/ltx-video-distilled",
+            created_at=datetime.utcnow()
+        )
+
+        db.add(generation)
+        db.commit()
+        db.refresh(generation)
+
+        asyncio.create_task(VideoService._run_async_extension_job(gen_id, base_gen, req))
+        return generation
+
+    @staticmethod
     async def _run_async_job(gen_id: str, req: GenerationRequest, width: int, height: int, seed: int):
         queue = VideoService.get_job_queue(gen_id)
 
@@ -167,7 +206,6 @@ class VideoService:
                 provider = mock_video_provider
                 provider_tag = "mock"
             else:
-                # MODE is local or cloud: Strict generator availability check
                 if await comfyui_provider.is_available():
                     provider = comfyui_provider
                     provider_tag = f"comfyui:{req.model_id or 'ltx-video'}"
@@ -194,6 +232,7 @@ class VideoService:
                 height=height,
                 fps=req.fps or 24,
                 seed=seed,
+                is_fixed_seed=req.is_fixed_seed or False,
                 steps=req.steps or 25,
                 guidance=req.guidance or 6.5,
                 job_id=gen_id,
@@ -206,6 +245,55 @@ class VideoService:
             err_msg = str(err)
             fail_event = {"job_id": gen_id, "status": "failed", "error": err_msg, "message": err_msg}
             await on_progress(fail_event)
+
+    @staticmethod
+    async def _run_async_extension_job(gen_id: str, base_gen: Generation, req: ExtendRequest):
+        queue = VideoService.get_job_queue(gen_id)
+
+        async def on_progress(event: dict):
+            await queue.put(event)
+            db_session = SessionLocal()
+            try:
+                g = db_session.query(Generation).filter(Generation.id == gen_id).first()
+                if g:
+                    g.status = event.get("status", g.status)
+                    g.progress = event.get("progress", g.progress)
+                    if event.get("video_url"):
+                        g.video_url = event["video_url"]
+                    if event.get("thumbnail_url"):
+                        g.thumbnail_url = event["thumbnail_url"]
+                    if event.get("provider"):
+                        g.provider = event["provider"]
+                    db_session.commit()
+            finally:
+                db_session.close()
+
+        try:
+            prev_video_url = base_gen.video_url.lstrip("/") if base_gen.video_url else ""
+            prev_video_abs_path = os.path.join(BASE_DIR, prev_video_url)
+
+            if await hf_space_provider.is_available():
+                res = await hf_space_provider.extend_video(
+                    prev_video_abs_path=prev_video_abs_path,
+                    prompt=base_gen.prompt,
+                    negative_prompt=base_gen.negative_prompt,
+                    project_id=base_gen.project_id or "default",
+                    job_id=gen_id,
+                    progress_callback=on_progress
+                )
+                await on_progress(res)
+            else:
+                mock_res = await mock_video_provider.generate_video(
+                    prompt=base_gen.prompt,
+                    negative_prompt=base_gen.negative_prompt,
+                    duration=5,
+                    job_id=gen_id,
+                    progress_callback=on_progress
+                )
+                await on_progress(mock_res)
+        except Exception as err:
+            err_msg = str(err)
+            await on_progress({"job_id": gen_id, "status": "failed", "error": err_msg, "message": err_msg})
 
 
 video_service = VideoService()

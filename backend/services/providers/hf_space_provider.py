@@ -16,6 +16,31 @@ logger = logging.getLogger("cineforge.hf_space_provider")
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 CONFIG_SPACES_PATH = os.path.join(BASE_DIR, "config", "spaces.json")
+DEFAULT_NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
+
+
+def snap_to_multiple_of_32(val: int) -> int:
+    return max(32, int(round(val / 32.0)) * 32)
+
+
+def find_video_path_in_obj(obj) -> str:
+    """Recursively extract local MP4/video filepath string from Gradio return objects"""
+    if isinstance(obj, str):
+        if obj.endswith((".mp4", ".webm", ".avi", ".mkv")) or os.path.exists(obj):
+            return obj
+    elif isinstance(obj, dict):
+        if "path" in obj and isinstance(obj["path"], str) and os.path.exists(obj["path"]):
+            return obj["path"]
+        for key, val in obj.items():
+            res = find_video_path_in_obj(val)
+            if res:
+                return res
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            res = find_video_path_in_obj(item)
+            if res:
+                return res
+    return None
 
 
 class HuggingFaceSpaceProvider(VideoProvider):
@@ -36,14 +61,14 @@ class HuggingFaceSpaceProvider(VideoProvider):
         return []
 
     def get_client(self):
-        """Reuse one Gradio Client per provider instance (Requirement 4)"""
+        """Reuse one Gradio Client instance per provider instance (Requirement 4)"""
         if self._client is None:
             from gradio_client import Client
             self._client = Client(self.space_id, token=self.token)
             if not self._logged_api:
                 try:
                     api_info = self._client.view_api(return_format="dict")
-                    logger.info(f"Connected to HF Space '{self.space_id}' API Signature:\n{json.dumps(api_info, indent=2)}")
+                    logger.info(f"Connected to HF Space '{self.space_id}' - API Signature:\n{json.dumps(api_info, indent=2)}")
                 except Exception as e:
                     logger.info(f"Connected to HF Space '{self.space_id}': {e}")
                 self._logged_api = True
@@ -60,159 +85,22 @@ class HuggingFaceSpaceProvider(VideoProvider):
             logger.warning(f"HuggingFace Space '{self.space_id}' not reachable: {e}")
             return False
 
-    def select_endpoint(self, is_i2v: bool) -> str:
-        space_cfg = None
-        for item in self._spaces_config:
-            if item.get("id") == self.space_id:
-                space_cfg = item
-                break
-
-        if space_cfg and "endpoints" in space_cfg:
-            ep = space_cfg["endpoints"].get("i2v" if is_i2v else "t2v")
-            if ep:
-                return ep
-
-        return "/image_to_video" if is_i2v else "/text_to_video"
-
-    def _validate_and_coerce_type(self, p_name: str, val: any, p_python_type: str, spec: dict) -> any:
-        if val is None:
-            return None
-
-        # Check Literal / enum options
-        enum_options = spec.get("type", {}).get("enum")
-        if enum_options and val not in enum_options:
-            raise RuntimeError(f"Parameter '{p_name}' value '{val}' is invalid. Allowed options: {enum_options}")
-
-        p_type_str = str(spec.get("type", "")).lower()
-
-        if p_python_type == "bool" or "boolean" in p_type_str:
-            if isinstance(val, str):
-                if val.lower() in ["true", "1"]: return True
-                if val.lower() in ["false", "0"]: return False
-            return bool(val)
-        elif p_python_type == "int" or "integer" in p_type_str:
-            try:
-                return int(val)
-            except Exception:
-                raise RuntimeError(f"Parameter '{p_name}' expected int, got '{type(val).__name__}': {val}")
-        elif p_python_type == "float" or "number" in p_type_str:
-            try:
-                return float(val)
-            except Exception:
-                raise RuntimeError(f"Parameter '{p_name}' expected float, got '{type(val).__name__}': {val}")
-        elif p_python_type == "str" or "string" in p_type_str:
-            if not isinstance(val, (str, type(None))):
-                return str(val)
-
-        return val
-
-    def map_and_validate_parameters(
-        self,
-        client,
-        endpoint_name: str,
-        prompt: str,
-        negative_prompt: str,
-        image_path: str = None,
-        duration: int = 5,
-        width: int = 704,
-        height: int = 512,
-        fps: int = 24,
-        seed: int = 42,
-        is_fixed_seed: bool = False,
-        steps: int = 25,
-        guidance: float = 6.5,
-        is_i2v: bool = False
-    ) -> tuple[list, dict, list]:
-        from gradio_client import handle_file
-
-        api_dict = client.view_api(return_format="dict")
-        named = api_dict.get("named_endpoints", {})
-        unnamed = api_dict.get("unnamed_endpoints", {})
-        all_endpoints = {**named, **unnamed}
-
-        if endpoint_name not in all_endpoints:
-            endpoint_name = list(all_endpoints.keys())[0]
-
-        param_specs = all_endpoints[endpoint_name].get("parameters", [])
-
-        args = []
-        mapped_log = {}
-        clamped_notes = []
-
-        space_cfg = None
-        for item in self._spaces_config:
-            if item.get("id") == self.space_id:
-                space_cfg = item
-                break
-
-        param_map_table = space_cfg.get("parameter_mapping", {}) if space_cfg else {}
-
-        handle_img = handle_file(image_path) if (is_i2v and image_path and os.path.exists(image_path)) else None
-
-        for spec in param_specs:
-            p_name = spec.get("parameter_name") or spec.get("name") or ""
-            p_default = spec.get("parameter_default", spec.get("default", None))
-            p_type_info = spec.get("type", {})
-            p_python_type = spec.get("python_type", {}).get("type", "")
-
-            val = None
-
-            # Explicit parameter_name mapping (Requirement 1)
-            if p_name == "prompt":
-                val = prompt
-            elif p_name == "negative_prompt":
-                val = negative_prompt or ""
-            elif p_name == "input_image_filepath":
-                val = handle_img if is_i2v else None
-            elif p_name == "input_video_filepath":
-                val = None
-            elif p_name == "height_ui":
-                val = height
-            elif p_name == "width_ui":
-                val = width
-            elif p_name == "mode":
-                val = "image-to-video" if is_i2v else "text-to-video"
-            elif p_name == "duration_ui":
-                val = duration
-            elif p_name == "ui_frames_to_use":
-                # Leave at Space's parameter_default (9); never derive from duration
-                val = p_default if p_default is not None else 9
-            elif p_name == "seed_ui":
-                val = seed
-            elif p_name == "randomize_seed":
-                val = not bool(is_fixed_seed)
-            elif p_name == "ui_guidance_scale":
-                # Distilled model default is 1.0 unless user changed it from default 6.5
-                val = 1.0 if (guidance == 6.5 or guidance is None) else float(guidance)
-            elif p_name == "improve_texture_flag":
-                val = True
-            else:
-                val = p_default
-                logger.info(f"Parameter '{p_name}' has no explicit mapping rule. Using parameter_default: {p_default}")
-
-            # Numeric slider range bounds check
-            if isinstance(p_type_info, dict) and "description" in p_type_info:
-                desc = p_type_info["description"]
-                m = re.search(r"between\s+([\d\.]+)\s+and\s+([\d\.]+)", desc)
-                if m and isinstance(val, (int, float)):
-                    min_b = float(m.group(1))
-                    max_b = float(m.group(2))
-                    if val < min_b:
-                        logger.warning(f"Parameter '{p_name}' value {val} is below minimum {min_b}. Clamping to {min_b}")
-                        val = type(val)(min_b)
-                    elif val > max_b:
-                        logger.warning(f"Parameter '{p_name}' value {val} exceeds maximum {max_b}. Clamping to {max_b}")
-                        if p_name == "duration_ui":
-                            clamped_notes.append(f"Duration clamped to Space maximum ({max_b}s). Use 'Extend (+5s)' to generate longer clips.")
-                        val = type(val)(max_b)
-
-            # Validate and coerce type (Requirement 2)
-            val = self._validate_and_coerce_type(p_name, val, p_python_type, spec)
-
-            args.append(val)
-            mapped_log[p_name] = val
-
-        return args, mapped_log, clamped_notes
+    def get_image_dimensions(self, handle_img_obj) -> tuple[int, int]:
+        """
+        Call /handle_image_upload_for_dims helper endpoint (Requirement 2)
+        """
+        try:
+            client = self.get_client()
+            res = client.predict(handle_img_obj, 512, 704, api_name="/handle_image_upload_for_dims")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                raw_h, raw_w = float(res[0]), float(res[1])
+                h_32 = snap_to_multiple_of_32(int(raw_h))
+                w_32 = snap_to_multiple_of_32(int(raw_w))
+                logger.info(f"Helper /handle_image_upload_for_dims returned raw {raw_h}x{raw_w} -> snapped to {h_32}x{w_32}")
+                return h_32, w_32
+        except Exception as e:
+            logger.warning(f"Failed to query /handle_image_upload_for_dims: {e}")
+        return 512, 704
 
     async def generate_video(
         self,
@@ -220,8 +108,8 @@ class HuggingFaceSpaceProvider(VideoProvider):
         negative_prompt: str,
         image_url: str = None,
         duration: int = 5,
-        width: int = 1280,
-        height: int = 720,
+        width: int = 704,
+        height: int = 512,
         fps: int = 24,
         seed: int = 42,
         is_fixed_seed: bool = False,
@@ -231,15 +119,19 @@ class HuggingFaceSpaceProvider(VideoProvider):
         progress_callback = None
     ) -> dict:
         try:
-            client = self.get_client()
-        except Exception as e:
-            err_msg = f"Failed to connect to HuggingFace Space '{self.space_id}': {e}"
+            from gradio_client import handle_file
+        except ImportError:
+            err_msg = "gradio_client python package is not installed."
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
+        client = self.get_client()
         is_i2v = bool(image_url)
+
+        # 1. Process Reference Image Argument (Requirement 1)
+        abs_img_path = None
+        handle_img_obj = None
         temp_img_file = None
-        local_img_path = None
 
         if is_i2v and image_url:
             if image_url.startswith("data:image"):
@@ -249,62 +141,81 @@ class HuggingFaceSpaceProvider(VideoProvider):
                 temp_img_file = tempfile.NamedTemporaryFile("wb", delete=False, suffix=ext)
                 temp_img_file.write(img_bytes)
                 temp_img_file.close()
-                local_img_path = temp_img_file.name
+                abs_img_path = os.path.abspath(temp_img_file.name)
             elif os.path.exists(image_url):
-                local_img_path = image_url
+                abs_img_path = os.path.abspath(image_url)
 
-        endpoint_name = self.select_endpoint(is_i2v)
-        args, mapped_log, clamped_notes = self.map_and_validate_parameters(
-            client=client,
-            endpoint_name=endpoint_name,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image_path=local_img_path,
-            duration=duration,
-            width=width,
-            height=height,
-            fps=fps,
-            seed=seed,
-            is_fixed_seed=is_fixed_seed,
-            steps=steps,
-            guidance=guidance,
-            is_i2v=is_i2v
+            if abs_img_path and os.path.exists(abs_img_path):
+                handle_img_obj = handle_file(abs_img_path)
+                logger.info(f"Image Argument - Type: {type(handle_img_obj).__name__}, Absolute Path: '{abs_img_path}'")
+            else:
+                logger.warning(f"Provided image path '{image_url}' could not be resolved.")
+
+        # 2. Dimensions calculation (Requirement 2)
+        if is_i2v and handle_img_obj:
+            height_ui, width_ui = self.get_image_dimensions(handle_img_obj)
+        else:
+            height_ui = snap_to_multiple_of_32(height or 512)
+            width_ui = snap_to_multiple_of_32(width or 704)
+
+        # 3. Duration clamping to 2s max on first attempt (Requirement 3)
+        duration_ui = min(int(duration or 2), 2)
+        job_msg = "This Space generates up to ~2 s per clip; use Extend to chain clips."
+        logger.info(f"Target duration_ui set to {duration_ui}s (Requested: {duration}s). {job_msg}")
+
+        # 4. Construct exact positional arguments for /image_to_video or /text_to_video (Requirement 4)
+        api_name = "/image_to_video" if is_i2v else "/text_to_video"
+        neg_prompt_clean = negative_prompt.strip() if (negative_prompt and negative_prompt.strip()) else DEFAULT_NEGATIVE_PROMPT
+
+        args = [
+            str(prompt),
+            str(neg_prompt_clean),
+            handle_img_obj if is_i2v else None,
+            None,  # input_video_filepath
+            float(height_ui),
+            float(width_ui),
+            "image-to-video" if is_i2v else "text-to-video",
+            float(duration_ui),
+            9.0,   # ui_frames_to_use (fixed at Space default 9)
+            int(seed),
+            not bool(is_fixed_seed),  # randomize_seed (bool)
+            1.0 if (guidance == 6.5 or guidance is None) else float(guidance),  # ui_guidance_scale
+            True   # improve_texture_flag (bool)
+        ]
+
+        logger.info(
+            f"Invoking HF Space '{self.space_id}' API '{api_name}' with argument types: "
+            f"{[type(a).__name__ for a in args]}"
         )
 
-        logger.info(f"Submitting to HF Space '{self.space_id}' endpoint '{endpoint_name}' with parameter values:\n{json.dumps({k: str(v) for k, v in mapped_log.items()}, indent=2)}")
-
         if progress_callback:
-            msg = f"Connecting to HuggingFace Space: {self.space_id}..."
-            if clamped_notes:
-                msg += f" ({clamped_notes[0]})"
             await progress_callback({
                 "job_id": job_id,
                 "status": "processing",
                 "progress": 10.0,
                 "current_step": 1,
                 "total_steps": steps or 25,
-                "eta_seconds": 30,
-                "message": msg
+                "eta_seconds": 25,
+                "message": f"HF Space: {job_msg}"
             })
 
-        # Submit to Gradio queue with automated range error retry handling (Requirement 3)
-        result_tuple = None
+        # 5. Execute predict call with queue polling (Requirement 5)
         try:
-            job = client.submit(*args, api_name=endpoint_name)
+            job = client.submit(*args, api_name=api_name)
             step_count = 1
             while not job.done():
                 await asyncio.sleep(1.0)
                 step_count += 1
                 status = job.status()
-                eta = status.eta if hasattr(status, 'eta') and status.eta is not None else max(0, 45 - step_count)
+                eta = status.eta if hasattr(status, 'eta') and status.eta is not None else max(0, 30 - step_count)
                 queue_pos = getattr(status, 'queue_size', None)
-                msg = f"HF Space Queue position: {queue_pos}" if queue_pos else "HF Space synthesizing AI video..."
+                msg = f"HF Space Queue position: {queue_pos}" if queue_pos else "Synthesizing AI video..."
 
                 if progress_callback:
                     await progress_callback({
                         "job_id": job_id,
                         "status": "processing",
-                        "progress": min(95.0, round(step_count * 3.5, 1)),
+                        "progress": min(95.0, round(step_count * 4.0, 1)),
                         "current_step": min(steps or 25, step_count),
                         "total_steps": steps or 25,
                         "eta_seconds": int(eta),
@@ -312,74 +223,63 @@ class HuggingFaceSpaceProvider(VideoProvider):
                     })
 
             result_tuple = job.result()
+            logger.info(f"Gradio raw return object: {result_tuple}")
         except Exception as err:
-            err_str = str(err)
-            # Range error parsing & one-time retry
-            m_range = re.search(r"Value\s+([\d\.]+)\s+is\s+(less|greater)\s+than\s+(minimum|maximum)\s+value\s+([\d\.]+)", err_str)
-            if m_range:
-                bad_val = float(m_range.group(1))
-                bound_val = float(m_range.group(4))
-                logger.warning(f"Gradio Range Error: Value {bad_val} out of bounds. Retrying once with clamped value {bound_val}...")
-                
-                # Update failing argument in positional list
-                for i in range(len(args)):
-                    if args[i] == bad_val or (isinstance(args[i], (int, float)) and abs(args[i] - bad_val) < 0.01):
-                        args[i] = type(args[i])(bound_val) if isinstance(args[i], int) else bound_val
+            if temp_img_file and os.path.exists(temp_img_file.name):
+                try: os.remove(temp_img_file.name)
+                except Exception: pass
 
-                # Single retry
-                retry_job = client.submit(*args, api_name=endpoint_name)
-                while not retry_job.done():
-                    await asyncio.sleep(1.0)
-                result_tuple = retry_job.result()
-            else:
-                # Verbatim error surfacing (Requirement 5)
-                if temp_img_file and os.path.exists(temp_img_file.name):
-                    try: os.remove(temp_img_file.name)
-                    except Exception: pass
-                logger.error(f"HuggingFace Space '{self.space_id}' verbatim error: {err_str}")
-                raise RuntimeError(err_str)
+            err_str = str(err)
+            verbatim_error = f"HuggingFace Space '{self.space_id}' ({api_name}) Error: {err_str}"
+            logger.error(verbatim_error)
+            raise RuntimeError(verbatim_error)
 
         if temp_img_file and os.path.exists(temp_img_file.name):
             try: os.remove(temp_img_file.name)
             except Exception: pass
 
-        # Parse Gradio result tuple
-        if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 0:
-            result_path = result_tuple[0]
-        else:
-            result_path = result_tuple
+        # 6. Parse Gradio output tuple (Requirement 5)
+        returned_seed = seed
+        if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 1:
+            try: returned_seed = int(result_tuple[1])
+            except Exception: pass
 
-        if isinstance(result_path, dict) and "path" in result_path:
-            result_path = result_path["path"]
+        video_path_str = find_video_path_in_obj(result_tuple)
 
-        if not result_path or not os.path.exists(str(result_path)):
-            err_msg = f"HuggingFace Space '{self.space_id}' returned no output video file."
+        if not video_path_str or not os.path.exists(video_path_str):
+            err_msg = f"HuggingFace Space '{self.space_id}' returned output object without valid video path: {result_tuple}"
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
+        logger.info(f"Successfully resolved output video path: {video_path_str}")
+
+        # Copy into generated/projects/<id>/videos/<job_id>.mp4
         project_id = "default"
         dirs = storage_service.get_project_dirs(project_id)
         local_video_filename = f"{job_id}.mp4"
         dest_abs_path = os.path.join(dirs["videos"], local_video_filename)
 
-        if str(result_path).endswith(".mp4"):
-            shutil.copy(result_path, dest_abs_path)
+        ffmpeg_bin = ffmpeg_service.get_ffmpeg_path()
+        if ffmpeg_bin:
+            import subprocess
+            subprocess.run([
+                ffmpeg_bin, "-y", "-i", video_path_str,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                dest_abs_path
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
-            ffmpeg_bin = ffmpeg_service.get_ffmpeg_path()
-            if ffmpeg_bin:
-                import subprocess
-                subprocess.run([
-                    ffmpeg_bin, "-y", "-i", str(result_path),
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                    dest_abs_path
-                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            else:
-                shutil.copy(result_path, dest_abs_path)
+            shutil.copy(video_path_str, dest_abs_path)
 
         local_url = f"/generated/projects/{project_id}/videos/{local_video_filename}"
-        thumbnail_url = image_url if is_i2v else "https://images.unsplash.com/photo-1519501025264-65ba15a82390?auto=format&fit=crop&w=800&q=80"
 
-        # Requirement 5: Provider badge hf-space:Lightricks/ltx-video-distilled
+        # Generate thumbnail image
+        thumb_filename = f"{job_id}.jpg"
+        thumb_abs_path = os.path.join(dirs["thumbnails"], thumb_filename)
+        if ffmpeg_service.extract_thumbnail(dest_abs_path, thumb_abs_path):
+            thumbnail_url = f"/generated/projects/{project_id}/thumbnails/{thumb_filename}"
+        else:
+            thumbnail_url = image_url if is_i2v else "https://images.unsplash.com/photo-1519501025264-65ba15a82390?auto=format&fit=crop&w=800&q=80"
+
         provider_badge = f"hf-space:{self.space_id}"
 
         result = {
@@ -391,8 +291,81 @@ class HuggingFaceSpaceProvider(VideoProvider):
             "eta_seconds": 0,
             "video_url": local_url,
             "thumbnail_url": thumbnail_url,
+            "seed": returned_seed,
             "is_mock": False,
-            "provider": provider_badge
+            "provider": provider_badge,
+            "message": job_msg
+        }
+
+        if progress_callback:
+            await progress_callback(result)
+
+        return result
+
+    async def extend_video(
+        self,
+        prev_video_abs_path: str,
+        prompt: str,
+        negative_prompt: str,
+        project_id: str = "default",
+        job_id: str = None,
+        progress_callback = None
+    ) -> dict:
+        if not os.path.exists(prev_video_abs_path):
+            raise RuntimeError(f"Previous video file for Extend not found: {prev_video_abs_path}")
+
+        dirs = storage_service.get_project_dirs(project_id)
+        last_frame_path = os.path.join(dirs["images"], f"ext_frame_{job_id}.png")
+
+        # 1. Extract last frame from previous clip
+        if not ffmpeg_service.extract_last_frame(prev_video_abs_path, last_frame_path):
+            raise RuntimeError("Failed to extract end frame from previous video for extension.")
+
+        # 2. Synthesize new ~2s continuation clip
+        new_clip_job_id = f"{job_id}_clip2"
+        res_new = await self.generate_video(
+            prompt=prompt or "Seamless camera continuation movement",
+            negative_prompt=negative_prompt or "",
+            image_url=last_frame_path,
+            duration=2,
+            width=704,
+            height=512,
+            fps=24,
+            job_id=new_clip_job_id,
+            progress_callback=progress_callback
+        )
+
+        new_clip_rel_url = res_new.get("video_url")
+        new_clip_abs_path = os.path.join(BASE_DIR, new_clip_rel_url.lstrip("/"))
+
+        # 3. Concatenate clips with FFmpeg
+        final_filename = f"{job_id}.mp4"
+        final_abs_path = os.path.join(dirs["videos"], final_filename)
+
+        if not ffmpeg_service.concat_videos([prev_video_abs_path, new_clip_abs_path], final_abs_path):
+            raise RuntimeError("FFmpeg concatenation of video extension clips failed.")
+
+        if os.path.exists(last_frame_path):
+            try: os.remove(last_frame_path)
+            except Exception: pass
+
+        local_url = f"/generated/projects/{project_id}/videos/{final_filename}"
+        thumb_filename = f"{job_id}.jpg"
+        thumb_abs_path = os.path.join(dirs["thumbnails"], thumb_filename)
+        ffmpeg_service.extract_thumbnail(final_abs_path, thumb_abs_path)
+        thumbnail_url = f"/generated/projects/{project_id}/thumbnails/{thumb_filename}"
+
+        warn_msg = "Chained video clips with HuggingFace Space. Note: Long video chains may exhibit slight quality or motion drift."
+
+        result = {
+            "job_id": job_id,
+            "status": "completed",
+            "progress": 100.0,
+            "video_url": local_url,
+            "thumbnail_url": thumbnail_url,
+            "is_mock": False,
+            "provider": f"hf-space:{self.space_id}",
+            "message": warn_msg
         }
 
         if progress_callback:
