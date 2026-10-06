@@ -1,0 +1,65 @@
+{
+  "3": {
+    "inputs": {
+      "seed": "{{SEED}}",
+      "steps": "{{STEPS}}",
+      "cfg": "{{CFG}}",
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 0.85,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["10", 0]
+    },
+    "class_type": "KSampler"
+  },
+  "4": {
+    "inputs": {
+      "ckpt_name": "ltx-video-2b-v0.9.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple"
+  },
+  "6": {
+    "inputs": {
+      "text": "{{PROMPT}}",
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "7": {
+    "inputs": {
+      "text": "{{NEGATIVE_PROMPT}}",
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "8": {
+    "inputs": {
+      "samples": ["3", 0],
+      "vae": ["4", 2]
+    },
+    "class_type": "VAEDecode"
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "CineForge_LTXV_I2V",
+      "fps": "{{FPS}}",
+      "images": ["8", 0]
+    },
+    "class_type": "VHS_VideoCombine"
+  },
+  "10": {
+    "inputs": {
+      "pixels": ["11", 0],
+      "vae": ["4", 2]
+    },
+    "class_type": "VAEEncode"
+  },
+  "11": {
+    "inputs": {
+      "image": "{{IMAGE_NAME}}"
+    },
+    "class_type": "LoadImage"
+  }
+}

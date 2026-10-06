@@ -1,0 +1,63 @@
+[
+  {
+    "id": "ltx-video",
+    "name": "LTX-Video (Default)",
+    "provider": "Lightricks / OpenSource",
+    "requiredVramGb": 8,
+    "recommendedVramGb": 12,
+    "supportedResolutions": ["512p", "720p"],
+    "supportedRatios": ["16:9", "9:16", "1:1"],
+    "supportedFps": [16, 24],
+    "workflowFile": "ltx_video_t2v.json",
+    "description": "Fast, highly efficient real-time local text-to-video & image-to-video model.",
+    "isDefault": true
+  },
+  {
+    "id": "wan-2.1",
+    "name": "Wan 2.1 (T2V & I2V)",
+    "provider": "Wan-AI / Alibaba Cloud",
+    "requiredVramGb": 12,
+    "recommendedVramGb": 16,
+    "supportedResolutions": ["512p", "720p", "1080p"],
+    "supportedRatios": ["16:9", "9:16", "1:1", "4:5"],
+    "supportedFps": [16, 24, 30],
+    "workflowFile": "wan_21_t2v.json",
+    "description": "Ultra-high precision cinematic motion dynamics with state-of-the-art detail."
+  },
+  {
+    "id": "hunyuan-video",
+    "name": "HunyuanVideo",
+    "provider": "Tencent",
+    "requiredVramGb": 16,
+    "recommendedVramGb": 24,
+    "supportedResolutions": ["720p", "1080p"],
+    "supportedRatios": ["16:9", "9:16"],
+    "supportedFps": [24, 30],
+    "workflowFile": "hunyuan_t2v.json",
+    "description": "Large-scale transformer model for photorealistic motion and physics accuracy."
+  },
+  {
+    "id": "cogvideox",
+    "name": "CogVideoX-5B",
+    "provider": "THUDM",
+    "requiredVramGb": 12,
+    "recommendedVramGb": 16,
+    "supportedResolutions": ["512p", "720p"],
+    "supportedRatios": ["16:9", "9:16", "1:1"],
+    "supportedFps": [16, 24],
+    "workflowFile": "cogvideox_t2v.json",
+    "description": "Rich temporal coherence and expressive artistic lighting styling."
+  },
+  {
+    "id": "svd",
+    "name": "Stable Video Diffusion (SVD)",
+    "provider": "Stability AI",
+    "requiredVramGb": 8,
+    "recommendedVramGb": 12,
+    "supportedResolutions": ["512p"],
+    "supportedRatios": ["16:9"],
+    "supportedFps": [16, 24],
+    "workflowFile": "svd_i2v.json",
+    "description": "Specialized image-to-video diffusion baseline with natural camera motion."
+  }
+]

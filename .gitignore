@@ -1,0 +1,41 @@
+# Environment & Secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+ENV/
+
+# Database & SQLite
+*.db
+*.sqlite
+*.sqlite3
+database/*.db
+
+# Frontend / Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.npm/
+
+# Large generated assets (images, videos, thumbnails)
+generated/projects/*/images/*
+generated/projects/*/videos/*
+generated/projects/*/thumbnails/*
+generated/projects/*/input/*
+!generated/**/.gitkeep
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.antigravity/
+.antigravity-ide/
